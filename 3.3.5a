@@ -1,0 +1,749 @@
+# LightBurn Serial GUI (v3.3.5) — Up-Next-only layout
+# Completed panel fully removed from UI, but CSV writing unchanged.
+
+import os, json, csv, sys, subprocess, platform, glob, shutil
+from datetime import datetime, timedelta, date
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+DEFAULT_CONFIG = {
+    "ROOT": r"C:\LaserSerials",
+    "JOBS": {
+        "Job A": {"display_name": "Job A", "part_number": "PN123", "default_batch": 28, "lightburn_file": r"C:\LaserSerials\Jobs\JobA.lbrn2"},
+        "Job B": {"display_name": "Job B", "part_number": "PN456", "default_batch": 28, "lightburn_file": r"C:\LaserSerials\Jobs\JobB.lbrn2"},
+        "Job C": {"display_name": "Job C", "part_number": "PN789", "default_batch": 28, "lightburn_file": r"C:\LaserSerials\Jobs\JobC.lbrn2"}
+    },
+    "OPEN_LB_FILE_ON_START": True,
+    "SERIAL": {"enabled": False, "port": "COM6", "baud": 115200, "start_command": "START\n", "stop_command": "STOP\n", "done_token": "DONE", "poll_ms": 50},
+    "SIMULATE": {"enabled": False, "batch_done_on_done": True},
+    "MACHINE": {"enabled": False, "code": ""},
+    "UI": {
+        "up_next_tail": 28,
+        "job_button_colors": {"Job A": "#2ecc71", "Job B": "#3498db", "Job C": "#e67e22"},
+        "hide_simulate_done": False,
+        "show_test_buttons": True
+    },
+    "LOGGING": {
+        "daily_max_rows": 20000,
+        "retain_mode": "off",
+        "retain_days": 7,
+        "write_planned": True
+    }
+}
+
+def deep_merge(a, b):
+    out = dict(a)
+    for k, v in b.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+def today_code(): return datetime.now().strftime("%y%m%d")
+def serial4(n): return f"{n:04d}"
+def build_fullcode(pn, dc, s4, cfg):
+    mc = ""
+    try:
+        if cfg.get("MACHINE", {}).get("enabled"):
+            raw = (cfg.get("MACHINE", {}).get("code") or "").strip().upper()
+            if raw: mc = f"-{raw[:2]}"
+    except Exception: pass
+    return f"{pn}-{dc}{mc}-{s4}"
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("LightBurn Serial GUI v3.3.5a")
+        self.geometry("1180x820")
+        self.resizable(True, True)
+
+        self.CONFIG = self.load_or_init_config()
+        self.DIRS, self.LB_BATCH, self.WORKING_BATCH, self.WORKING_COMPLETED_TODAY = self.derive_paths()
+        self.ensure_dirs()
+        self.enforce_retention_on_startup()
+
+        self.banner = tk.Label(self, text="Idle", font=("Segoe UI", 14, "bold"), fg="white", bg="#7f8c8d", padx=10, pady=6)
+        self.banner.pack(fill="x")
+
+        top = ttk.Frame(self, padding=8); top.pack(fill="x")
+        self.clock_var = tk.StringVar(value="--:--:--")
+        ttk.Label(top, textvariable=self.clock_var, font=("Segoe UI", 18, "bold")).pack(side="left")
+
+        ms = ttk.Frame(top); ms.pack(side="right")
+        ttk.Label(ms, text="Machine:").pack(side="left", padx=(0,6))
+        self.machine_label = tk.Label(ms, text="Unknown", fg="white", bg="#7f8c8d", padx=10, pady=4)
+        self.machine_label.pack(side="left", padx=(0,10))
+        ttk.Label(ms, text="ESP32:").pack(side="left", padx=(0,6))
+        self.conn_label = tk.Label(ms, text="Disabled", fg="white", bg="#f39c12", padx=10, pady=4)
+        self.conn_label.pack(side="left")
+        ttk.Button(ms, text="Reconnect", command=self.on_reconnect).pack(side="left", padx=6)
+        ttk.Button(ms, text="Settings", command=self.open_settings).pack(side="left", padx=6)
+
+        self.after(200, self.tick_clock)
+
+        jobs = ttk.LabelFrame(self, text="Jobs", padding=10); jobs.pack(fill="x", padx=8, pady=4)
+        self.job_keys = list(self.CONFIG["JOBS"].keys())
+        self.selected_job = tk.StringVar(value=self.job_keys[0])
+        self.job_btns = {}
+        for i, key in enumerate(self.job_keys):
+            color = self.CONFIG["UI"]["job_button_colors"].get(key, "#bdc3c7")
+            disp = self.CONFIG["JOBS"][key].get("display_name", key)
+            b = tk.Button(jobs, text=disp, width=16, height=2, bg=color, fg="white", font=("Segoe UI", 12, "bold"),
+                          command=lambda k=key: self.on_job_clicked(k))
+            b.grid(row=0, column=i, padx=6, pady=4)
+            self.job_btns[key] = b
+
+        info = ttk.Frame(self, padding=8); info.pack(fill="x")
+        ttk.Label(info, text="Selected Job:").grid(row=0, column=0, sticky="e")
+        self.sel_job_lbl = ttk.Label(info, text=self.CONFIG["JOBS"][self.selected_job.get()]["display_name"], font=("Segoe UI", 11, "bold"))
+        self.sel_job_lbl.grid(row=0, column=1, sticky="w", padx=6)
+
+        ttk.Label(info, text="Part Number:").grid(row=0, column=2, sticky="e")
+        self.part_var = tk.StringVar(value=self.CONFIG["JOBS"][self.selected_job.get()]["part_number"])
+        ttk.Label(info, textvariable=self.part_var, font=("Segoe UI", 11, "bold")).grid(row=0, column=3, sticky="w", padx=6)
+
+        ttk.Label(info, text="Date Code:").grid(row=0, column=4, sticky="e")
+        self.date_var = tk.StringVar(value=today_code())
+        ttk.Label(info, textvariable=self.date_var, font=("Segoe UI", 11, "bold")).grid(row=0, column=5, sticky="w", padx=6)
+
+        ttk.Label(info, text="Next Serial:").grid(row=0, column=6, sticky="e")
+        self.next_var = tk.StringVar(value="0001")
+        ttk.Label(info, textvariable=self.next_var, font=("Segoe UI", 11, "bold")).grid(row=0, column=7, sticky="w", padx=6)
+
+        batch = ttk.Frame(self, padding=8); batch.pack(fill="x")
+        ttk.Label(batch, text="Batch Size:").grid(row=0, column=0, sticky="e")
+        self.batch_var = tk.IntVar(value=self.CONFIG["JOBS"][self.selected_job.get()]["default_batch"])
+        be = ttk.Entry(batch, textvariable=self.batch_var, width=8); be.grid(row=0, column=1, sticky="w", padx=6)
+        be.bind("<KeyRelease>", lambda e: self.refresh_preview_upnext_and_lb())
+        ttk.Button(batch, text="Set as Default for Job", command=self.set_job_default_batch).grid(row=0, column=2, padx=8)
+
+        # Single "Up Next" panel
+        upnext_frame = ttk.Labelframe(self, text="Up Next (Preview / Current Batch) [0]", padding=8)
+        self.left_hdr = upnext_frame
+        upnext_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        inner = ttk.Frame(upnext_frame); inner.pack(fill="both", expand=True)
+        self.upnext_list = tk.Listbox(inner, height=24, font=("Consolas", 10))
+        self.upnext_list.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(inner, orient="vertical", command=self.upnext_list.yview)
+        sb.pack(side="right", fill="y")
+        self.upnext_list.config(yscrollcommand=sb.set)
+
+        controls = ttk.Frame(self, padding=8); controls.pack(fill="x")
+        self.start_btn = tk.Button(controls, text="START LASER", width=18, height=2, bg="#c0392b", fg="white", font=("Segoe UI", 14, "bold"), command=self.start_laser_flow)
+        self.start_btn.pack(side="left")
+        self.abort_btn = tk.Button(controls, text="ABORT / STOP", width=18, height=2, bg="#7f8c8d", fg="white", font=("Segoe UI", 14, "bold"), command=self.abort_stop_flow)
+        self.abort_btn.pack(side="left", padx=10)
+
+        self.sim_btn = ttk.Button(controls, text="Simulate DONE", command=self.sim_done)
+        self.sim_btn.pack(side="left", padx=10)
+
+        self.test_frame = ttk.Frame(controls)
+        ttk.Button(self.test_frame, text="Sim ESP: MARK", command=lambda: self.on_serial_line("STATE:MARK")).pack(side="left", padx=4)
+        ttk.Button(self.test_frame, text="Sim ESP: IDLE", command=lambda: self.on_serial_line("STATE:IDLE")).pack(side="left", padx=4)
+        ttk.Button(self.test_frame, text="Sim ESP: DONE", command=lambda: self.on_serial_line(self.CONFIG["SERIAL"]["done_token"])).pack(side="left", padx=4)
+        self.test_frame.pack(side="left", padx=6)
+
+        self.status_var = tk.StringVar(value="Idle.")
+        ttk.Label(self, textvariable=self.status_var).pack(fill="x", padx=8, pady=(0,8))
+
+        self.serial = SerialHelper(self.CONFIG["SERIAL"], self.update_conn_pill, self.on_serial_line)
+        if self.CONFIG["SERIAL"]["enabled"] and not self.CONFIG["SIMULATE"]["enabled"]:
+            self.serial.try_open(); self.after(self.CONFIG["SERIAL"]["poll_ms"], self.poll_serial)
+        else:
+            self.update_conn_pill("SIMULATE" if self.CONFIG["SIMULATE"]["enabled"] else "Disabled", warn=True)
+
+        self.refresh_next_serial_label()
+        self.refresh_preview_upnext_and_lb()
+        self.update_visibility_from_settings()
+
+    # ---------- Paths / Storage ----------
+    def derive_paths(self):
+        ROOT = self.CONFIG["ROOT"]
+        DIRS = {"config": os.path.join(ROOT, "Config"),
+                "lightburn": os.path.join(ROOT, "LightBurn"),
+                "working": os.path.join(ROOT, "Working"),
+                "logs": os.path.join(ROOT, "Logs"),
+                "jobs": os.path.join(ROOT, "Jobs")}
+        LB_BATCH = os.path.join(DIRS["lightburn"], "NextBatch.csv")
+        WORKING_BATCH = os.path.join(DIRS["working"], "CurrentBatch.csv")
+        WORKING_COMPLETED_TODAY = os.path.join(DIRS["working"], "Completed_Today.csv")
+        return DIRS, LB_BATCH, WORKING_BATCH, WORKING_COMPLETED_TODAY
+
+    def ensure_dirs(self):
+        for d in self.DIRS.values(): os.makedirs(d, exist_ok=True)
+        y = os.path.join(self.DIRS["logs"], datetime.now().strftime("%Y"))
+        os.makedirs(y, exist_ok=True); os.makedirs(os.path.join(y, today_code()), exist_ok=True)
+
+    def daily_dir(self): return os.path.join(self.DIRS["logs"], datetime.now().strftime("%Y"), today_code())
+    def config_file_path(self): return os.path.join(self.DIRS["config"], "gui_config.json")
+
+    def load_or_init_config(self):
+        cfg_dir = os.path.join(DEFAULT_CONFIG["ROOT"], "Config"); os.makedirs(cfg_dir, exist_ok=True)
+        cfg_path = os.path.join(cfg_dir, "gui_config.json")
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f: return deep_merge(DEFAULT_CONFIG, json.load(f))
+            except Exception: return dict(DEFAULT_CONFIG)
+        else:
+            with open(cfg_path, "w", encoding="utf-8") as f: json.dump(DEFAULT_CONFIG, f, indent=2)
+            return dict(DEFAULT_CONFIG)
+
+    def save_config(self):
+        try:
+            with open(self.config_file_path(), "w", encoding="utf-8") as f: json.dump(self.CONFIG, f, indent=2)
+            return True
+        except Exception as e:
+            messagebox.showerror("Save Config", f"Failed to save config:\n{e}"); return False
+
+    # ---------- Retention / housekeeping ----------
+    def enforce_retention_on_startup(self):
+        mode = self.CONFIG["LOGGING"].get("retain_mode", "off")
+        if mode == "off":
+            if os.path.exists(self.DIRS["logs"]):
+                try: shutil.rmtree(self.DIRS["logs"])
+                except Exception: pass
+        elif mode == "today_only":
+            y_root = self.DIRS["logs"]
+            if os.path.exists(y_root):
+                for y in os.listdir(y_root):
+                    ypath = os.path.join(y_root, y)
+                    if not os.path.isdir(ypath): continue
+                    for d in os.listdir(ypath):
+                        if d != today_code():
+                            shutil.rmtree(os.path.join(ypath, d), ignore_errors=True)
+        elif mode == "days":
+            keep_days = max(1, int(self.CONFIG["LOGGING"].get("retain_days", 7)))
+            self._purge_older_than_days(keep_days)
+
+    def _purge_older_than_days(self, n_days):
+        cutoff = date.today() - timedelta(days=n_days-1)
+        y_root = self.DIRS["logs"]
+        if not os.path.exists(y_root): return
+        for y in os.listdir(y_root):
+            ypath = os.path.join(y_root, y)
+            if not os.path.isdir(ypath): continue
+            for d in os.listdir(ypath):
+                dpath = os.path.join(ypath, d)
+                if not os.path.isdir(dpath): continue
+                try:
+                    dt = datetime.strptime(d, "%y%m%d").date()
+                    if dt < cutoff:
+                        shutil.rmtree(dpath, ignore_errors=True)
+                except Exception:
+                    pass
+
+    # ---------- UI helpers ----------
+    def set_banner(self, text, color): self.banner.config(text=text, bg=color)
+    def banner_idle(self): self.set_banner("Idle", "#7f8c8d")
+    def banner_engraving(self): self.set_banner("Engraving… please wait", "#c0392b")
+    def banner_warning(self, msg="Warning"): self.set_banner(msg, "#f39c12")
+    def banner_ok(self, msg="Complete"): self.set_banner(msg, "#27ae60")
+
+    def tick_clock(self):
+        self.clock_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.after(200, self.tick_clock)
+
+    def update_conn_pill(self, text, ok=False, warn=False):
+        bg = "#27ae60" if ok else ("#f39c12" if warn else "#e74c3c"); self.conn_label.config(text=text, bg=bg)
+
+    def update_machine_pill(self, text):
+        colors = {"IDLE":"#7f8c8d","MARK":"#c0392b","UNKNOWN":"#7f8c8d"}; self.machine_label.config(text=text, bg=colors.get(text, "#7f8c8d"))
+
+    def on_reconnect(self):
+        if self.CONFIG["SERIAL"]["enabled"] and not self.CONFIG["SIMULATE"]["enabled"]:
+            self.serial.reconnect()
+        else:
+            self.update_conn_pill("Disabled", warn=True)
+
+    def update_visibility_from_settings(self):
+        if self.CONFIG["UI"].get("hide_simulate_done"):
+            try: self.sim_btn.pack_forget()
+            except Exception: pass
+        else:
+            if not self.sim_btn.winfo_ismapped(): self.sim_btn.pack(side="left", padx=10)
+        if self.CONFIG["UI"].get("show_test_buttons", True):
+            if not self.test_frame.winfo_ismapped(): self.test_frame.pack(side="left", padx=6)
+        else:
+            try: self.test_frame.pack_forget()
+            except Exception: pass
+
+    # ---------- Jobs & preview ----------
+    def on_job_clicked(self, key):
+        self.selected_job.set(key)
+        self.sel_job_lbl.config(text=self.CONFIG["JOBS"][key].get("display_name", key))
+        self.part_var.set(self.CONFIG["JOBS"][key]["part_number"])
+        self.batch_var.set(self.CONFIG["JOBS"][key]["default_batch"])
+        self.refresh_next_serial_label()
+        self.refresh_preview_upnext_and_lb()
+        self.status_var.set(f"Selected {self.CONFIG['JOBS'][key].get('display_name', key)}.")
+        self.banner_idle()
+
+    def compute_next_serial_from_completed(self, pn):
+        mode = self.CONFIG["LOGGING"].get("retain_mode", "off")
+        max_ser = 0
+        if mode == "off":
+            if os.path.exists(self.WORKING_COMPLETED_TODAY):
+                with open(self.WORKING_COMPLETED_TODAY, "r", newline="", encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        if row.get("PartNumber")==pn and row.get("DateCode")==today_code():
+                            try: max_ser = max(max_ser, int(row.get("Serial4","0000")))
+                            except: pass
+        else:
+            for f in self.completed_files_today():
+                if os.path.exists(f):
+                    with open(f, "r", newline="", encoding="utf-8") as fh:
+                        for row in csv.DictReader(fh):
+                            if row.get("PartNumber")==pn and row.get("DateCode")==today_code():
+                                try: max_ser = max(max_ser, int(row.get("Serial4","0000")))
+                                except: pass
+        return max_ser + 1
+
+    def refresh_next_serial_label(self):
+        try:
+            pn = self.CONFIG["JOBS"][self.selected_job.get()]["part_number"]
+        except Exception:
+            pn = ""
+        next_n = self.compute_next_serial_from_completed(pn) if pn else 1
+        try:
+            self.next_var.set(f"{next_n:04d}")
+        except Exception:
+            pass
+
+    # ---------- Log file helpers (rotation) ----------
+    def completed_files_today(self):
+        base = os.path.join(self.daily_dir(), "Completed.csv")
+        pattern = os.path.join(self.daily_dir(), "Completed*.csv")
+        files = sorted(glob.glob(pattern), key=self._completed_sort_key)
+        return files if files else [base]
+
+    def planned_files_today(self):
+        base = os.path.join(self.daily_dir(), "Planned.csv")
+        pattern = os.path.join(self.daily_dir(), "Planned*.csv")
+        files = sorted(glob.glob(pattern), key=self._completed_sort_key)
+        return files if files else [base]
+
+    @staticmethod
+    def _completed_sort_key(path):
+        name = os.path.basename(path)
+        if "_" in name:
+            try: n = int(name.split("_",1)[1].split(".")[0])
+            except Exception: n = 1
+        else:
+            n = 1
+        return n
+
+    def _next_chunk_path(self, base_path):
+        folder, base = os.path.split(base_path)
+        stem, ext = os.path.splitext(base)
+        existing = sorted(glob.glob(os.path.join(folder, stem+"*.csv")), key=self._completed_sort_key)
+        if not existing: return base_path
+        last = os.path.basename(existing[-1])
+        if "_" in last:
+            try: idx = int(last.split("_",1)[1].split(".")[0]) + 1
+            except Exception: idx = 2
+            return os.path.join(folder, f"{stem}_{idx}.csv")
+        else:
+            return os.path.join(folder, f"{stem}_2.csv")
+
+    def _needs_rollover(self, path):
+        max_rows = int(self.CONFIG.get("LOGGING",{}).get("daily_max_rows", 20000))
+        if not os.path.exists(path): return False
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as fh:
+                r = csv.reader(fh); next(r, None)
+                for i, _ in enumerate(r, start=1):
+                    if i >= max_rows: return True
+        except Exception: pass
+        return False
+
+    def _append_row(self, path, fieldnames, row):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fieldnames)
+            if write_header: w.writeheader()
+            w.writerow(row)
+
+    def append_planned(self, rows):
+        if self.CONFIG["LOGGING"].get("retain_mode","off") == "off": return
+        if not self.CONFIG["LOGGING"].get("write_planned", True): return
+        base = os.path.join(self.daily_dir(), "Planned.csv")
+        target = self._next_chunk_path(base) if self._needs_rollover(base) else base
+        fns = ["Date","JobID","JobName","PartNumber","DateCode","Serial4","FullCode"]
+        with open(target, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fns)
+            if fh.tell() == 0: w.writeheader()
+            for r in rows:
+                w.writerow({
+                    "Date": datetime.now().strftime("%Y-%m-%d"),
+                    "JobID": r["JobID"], "JobName": r["JobName"],
+                    "PartNumber": r["PartNumber"], "DateCode": r["DateCode"],
+                    "Serial4": r["Serial4"], "FullCode": r["FullCode"],
+                })
+
+    def _completed_header(self):
+        return ["Time","JobName","PartNumber","DateCode","Serial4","Serial Number","Result"]
+
+    def append_completed_many(self, rows, result="OK"):
+        mode = self.CONFIG["LOGGING"].get("retain_mode", "off")
+        fns = self._completed_header()
+        out_rows = [{
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "JobName": r["JobName"],
+            "PartNumber": r["PartNumber"],
+            "DateCode": r["DateCode"],
+            "Serial4": r["Serial4"],
+            "Serial Number": r["FullCode"],
+            "Result": result
+        } for r in rows]
+
+        if mode == "off":
+            path = self.WORKING_COMPLETED_TODAY
+        else:
+            base = os.path.join(self.daily_dir(), "Completed.csv")
+            path = self._next_chunk_path(base) if self._needs_rollover(base) else base
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fns)
+            if write_header: w.writeheader()
+            for row in out_rows: w.writerow(row)
+
+    # ---------- Working batch ----------
+    def read_working_batch(self):
+        if not os.path.exists(self.WORKING_BATCH): return []
+        with open(self.WORKING_BATCH, "r", newline="", encoding="utf-8") as f: return list(csv.DictReader(f))
+
+    def write_working_batch(self, rows):
+        with open(self.WORKING_BATCH, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["Date","JobID","JobName","PartNumber","DateCode","Serial4","FullCode"])
+            w.writeheader(); w.writerows(rows)
+
+    def write_lightburn_batch(self, codes):
+        with open(self.LB_BATCH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f); w.writerow(["CODE"]); [w.writerow([c]) for c in codes]
+
+    # ---------- Preview ----------
+    def build_preview_rows(self):
+        key = self.selected_job.get(); cfg = self.CONFIG["JOBS"][key]
+        job_name = cfg.get("display_name", key)
+        pn, dc = cfg["part_number"], today_code()
+        try: n = max(1, int(self.batch_var.get()))
+        except Exception: n = cfg["default_batch"]
+        start_ser = self.compute_next_serial_from_completed(pn)
+        rows, codes = [], []
+        for i in range(n):
+            s4 = serial4(start_ser + i)
+            fc = build_fullcode(pn, dc, s4, self.CONFIG)
+            rows.append({"Date": datetime.now().strftime("%Y-%m-%d"),
+                         "JobID": key, "JobName": job_name,
+                         "PartNumber": pn, "DateCode": dc, "Serial4": s4, "FullCode": fc})
+            codes.append(fc)
+        return rows, codes
+
+    def refresh_preview_upnext_and_lb(self):
+        rows, codes = self.build_preview_rows()
+        self.upnext_list.delete(0, tk.END)
+        for r in rows[:self.CONFIG["UI"]["up_next_tail"]]:
+            self.upnext_list.insert(tk.END, f'{r["FullCode"]}')
+        try:
+            self.left_hdr.config(text=f"Up Next (Preview / Current Batch) [{len(rows)}]")
+        except Exception:
+            pass
+        self.write_lightburn_batch(codes)
+
+    # ---------- Start / Stop / Done / Cancel ----------
+    def start_laser_flow(self):
+        rows, codes = self.build_preview_rows()
+        self.write_working_batch(rows); self.append_planned(rows)
+        self.status_var.set("Batch queued. Engraving… please wait."); self.banner_engraving()
+
+        if self.CONFIG["OPEN_LB_FILE_ON_START"]:
+            key = self.selected_job.get(); lb_path = self.CONFIG["JOBS"][key]["lightburn_file"]
+            self.open_lightburn_file(lb_path)
+
+        if self.CONFIG["SIMULATE"]["enabled"]:
+            self.update_conn_pill("SIMULATE", warn=True)
+        else:
+            if self.CONFIG["SERIAL"]["enabled"]:
+                if not self.serial.send_start():
+                    self.status_var.set("Could not signal ESP32. Press foot pedal or check serial.")
+            else:
+                self.update_conn_pill("Disabled", warn=True)
+
+    def abort_stop_flow(self):
+        if self.CONFIG["SIMULATE"]["enabled"]:
+            self.status_var.set("Simulated STOP. Batch canceled."); self.banner_warning("Aborted")
+        else:
+            if self.CONFIG["SERIAL"]["enabled"]:
+                ok = self.serial.send_stop()
+                self.status_var.set("STOP sent to ESP32." if ok else "Failed to send STOP to ESP32.")
+            else:
+                self.update_conn_pill("Disabled", warn=True)
+        self.cancel_batch()
+
+    def sim_done(self):
+        if self.CONFIG["SIMULATE"]["batch_done_on_done"]:
+            self.complete_whole_batch(result="SIM")
+        else:
+            self.complete_one_item(result="SIM")
+
+    def cancel_batch(self):
+        if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
+        self.write_lightburn_batch([]); self.refresh_preview_upnext_and_lb()
+        self.status_var.set("Batch aborted / canceled. Queue cleared."); self.banner_warning("Aborted")
+        self.refresh_next_serial_label()
+
+    def on_serial_line(self, line):
+        line = (line or "").strip()
+        if not line: return
+        if line == self.CONFIG["SERIAL"]["done_token"]:
+            if self.CONFIG["SIMULATE"]["batch_done_on_done"]: self.complete_whole_batch()
+            else: self.complete_one_item()
+        elif line.upper().startswith("BATCH_DONE"): self.complete_whole_batch()
+        elif line.upper().startswith("STATE:"):
+            state = line.split(":",1)[1].strip().upper()
+            if state in ("IDLE","MARK"): self.update_machine_pill(state)
+
+    def complete_one_item(self, result="OK"):
+        rows = self.read_working_batch()
+        if not rows: self.status_var.set("Idle. (No items in queue)"); self.banner_idle(); return
+        head, rest = rows[0], rows[1:]
+        self.append_completed_many([head], result=result)
+        if rest:
+            self.write_working_batch(rest); self.write_lightburn_batch([r["FullCode"] for r in rest])
+            self.status_var.set("Next ready…"); self.banner_engraving()
+        else:
+            if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
+            self.refresh_preview_upnext_and_lb()
+            self.status_var.set("Batch complete."); self.banner_ok("Batch complete"); self.beep_batch_complete()
+        self.refresh_next_serial_label()
+
+    def complete_whole_batch(self, result="OK"):
+        rows = self.read_working_batch()
+        if not rows: self.status_var.set("Idle. (No items in queue)"); self.banner_idle(); return
+        self.append_completed_many(rows, result=result)
+        if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
+        self.refresh_preview_upnext_and_lb(); self.refresh_next_serial_label()
+        self.status_var.set("Batch complete (all items written)."); self.banner_ok("Batch complete"); self.beep_batch_complete()
+
+    def beep_batch_complete(self):
+        try:
+            if platform.system() == "Windows":
+                import winsound; winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            else:
+                print("\a", end="", flush=True)
+        except Exception: pass
+
+    def open_lightburn_file(self, path):
+        if not os.path.exists(path): messagebox.showerror("LightBurn File", f"File not found:\n{path}"); return False
+        try:
+            if platform.system() == "Windows": os.startfile(path)  # type: ignore
+            elif platform.system()=="Darwin": subprocess.Popen(["open", path])
+            else: subprocess.Popen(["xdg-open", path])
+            return True
+        except Exception as e:
+            messagebox.showerror("Open File", f"Could not open LightBurn file.\n{e}"); return False
+
+    def set_job_default_batch(self):
+        key = self.selected_job.get()
+        try: n = max(1, int(self.batch_var.get()))
+        except Exception: n = 1
+        self.CONFIG["JOBS"][key]["default_batch"] = n
+        self.save_config()
+        disp = self.CONFIG["JOBS"][key].get("display_name", key)
+        self.status_var.set(f"Default batch for {disp} set to {n}.")
+        self.refresh_preview_upnext_and_lb()
+
+    def open_settings(self):
+        win = tk.Toplevel(self); win.title("Settings"); win.geometry("1060x720")
+        nb = ttk.Notebook(win); nb.pack(fill="both", expand=True)
+
+        # Jobs tab
+        jobs_tab = ttk.Frame(nb, padding=10); nb.add(jobs_tab, text="Jobs")
+        row = 0; self._job_entries = {}
+        for key in self.job_keys:
+            jcfg = self.CONFIG["JOBS"][key]
+            ttk.Label(jobs_tab, text=key, font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", pady=(6,2))
+            dn_var = tk.StringVar(value=jcfg.get("display_name", key))
+            pn_var = tk.StringVar(value=jcfg["part_number"])
+            db_var = tk.IntVar(value=jcfg["default_batch"])
+            lb_var = tk.StringVar(value=jcfg["lightburn_file"])
+            ttk.Label(jobs_tab, text="Button Text:").grid(row=row+1, column=0, sticky="e")
+            ttk.Entry(jobs_tab, textvariable=dn_var, width=20).grid(row=row+1, column=1, sticky="w", padx=6)
+            ttk.Label(jobs_tab, text="Part Number:").grid(row=row+1, column=2, sticky="e")
+            ttk.Entry(jobs_tab, textvariable=pn_var, width=20).grid(row=row+1, column=3, sticky="w", padx=6)
+            ttk.Label(jobs_tab, text="Default Batch:").grid(row=row+1, column=4, sticky="e")
+            ttk.Entry(jobs_tab, textvariable=db_var, width=8).grid(row=row+1, column=5, sticky="w", padx=6)
+            ttk.Label(jobs_tab, text=".lbrn2 File:").grid(row=row+2, column=0, sticky="e")
+            ttk.Entry(jobs_tab, textvariable=lb_var, width=58).grid(row=row+2, column=1, columnspan=4, sticky="we", padx=6)
+            def browse_file(var=lb_var):
+                p = filedialog.askopenfilename(title="Select LightBurn file", filetypes=[("LightBurn","*.lbrn2"),("All files","*.*")])
+                if p: var.set(p)
+            ttk.Button(jobs_tab, text="Browse…", command=browse_file).grid(row=row+2, column=5, sticky="w")
+            ttk.Separator(jobs_tab, orient="horizontal").grid(row=row+3, column=0, columnspan=6, sticky="ew", pady=8)
+            self._job_entries[key] = (dn_var, pn_var, db_var, lb_var); row += 4
+
+        # System tab
+        sys_tab = ttk.Frame(nb, padding=10); nb.add(sys_tab, text="System")
+        self._root_var = tk.StringVar(value=self.CONFIG["ROOT"])
+        self._open_lb_var = tk.BooleanVar(value=self.CONFIG["OPEN_LB_FILE_ON_START"])
+        ttk.Label(sys_tab, text="Root Folder:").grid(row=0, column=0, sticky="e")
+        ttk.Entry(sys_tab, textvariable=self._root_var, width=60).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Button(sys_tab, text="Browse…", command=lambda: self._root_var.set(filedialog.askdirectory(title="Pick root folder") or self._root_var.get())).grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(sys_tab, text="Open LightBurn file on START", variable=self._open_lb_var).grid(row=1, column=1, sticky="w", pady=8)
+
+        # Serial & Sim tab
+        ser_tab = ttk.Frame(nb, padding=10); nb.add(ser_tab, text="Serial & Simulate")
+        self._ser_en_var = tk.BooleanVar(value=self.CONFIG["SERIAL"]["enabled"])
+        self._sim_en_var = tk.BooleanVar(value=self.CONFIG["SIMULATE"]["enabled"])
+        self._batch_done_var = tk.BooleanVar(value=self.CONFIG["SIMULATE"]["batch_done_on_done"])
+        self._ser_port_var = tk.StringVar(value=self.CONFIG["SERIAL"]["port"])
+        self._ser_baud_var = tk.IntVar(value=self.CONFIG["SERIAL"]["baud"])
+        self._hide_sim_var = tk.BooleanVar(value=self.CONFIG["UI"].get("hide_simulate_done", False))
+        self._show_tests_var = tk.BooleanVar(value=self.CONFIG["UI"].get("show_test_buttons", True))
+
+        ttk.Checkbutton(ser_tab, text="Enable serial (ESP32 pedal/stop)", variable=self._ser_en_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(ser_tab, text="Simulate Mode (no hardware)", variable=self._sim_en_var).grid(row=0, column=1, sticky="w", padx=12)
+        ttk.Checkbutton(ser_tab, text="Treat DONE as 'whole batch complete'", variable=self._batch_done_var).grid(row=0, column=2, sticky="w", padx=12)
+        ttk.Label(ser_tab, text="Port:").grid(row=1, column=0, sticky="e"); ttk.Entry(ser_tab, textvariable=self._ser_port_var, width=12).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(ser_tab, text="Baud:").grid(row=1, column=2, sticky="e"); ttk.Entry(ser_tab, textvariable=self._ser_baud_var, width=10).grid(row=1, column=3, sticky="w", padx=6)
+        ttk.Separator(ser_tab, orient="horizontal").grid(row=2, column=0, columnspan=6, sticky="ew", pady=10)
+        ttk.Checkbutton(ser_tab, text="Hide 'Simulate DONE' button", variable=self._hide_sim_var).grid(row=3, column=0, sticky="w")
+        ttk.Checkbutton(ser_tab, text="Show test buttons (Sim ESP signals)", variable=self._show_tests_var).grid(row=3, column=1, sticky="w", padx=12)
+
+        # History tab (for retention settings)
+        hist_tab = ttk.Frame(nb, padding=10); nb.add(hist_tab, text="History")
+        self._max_rows_var = tk.IntVar(value=int(self.CONFIG["LOGGING"].get("daily_max_rows", 20000)))
+        self._retain_mode_var = tk.StringVar(value=self.CONFIG["LOGGING"].get("retain_mode","off"))
+        self._retain_days_var = tk.IntVar(value=int(self.CONFIG["LOGGING"].get("retain_days", 7)))
+        self._write_planned_var = tk.BooleanVar(value=self.CONFIG["LOGGING"].get("write_planned", True))
+
+        ttk.Label(hist_tab, text="History Mode:").grid(row=0, column=0, sticky="e")
+        ttk.Radiobutton(hist_tab, text="Off (no history)", value="off", variable=self._retain_mode_var).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(hist_tab, text="Today only", value="today_only", variable=self._retain_mode_var).grid(row=0, column=2, sticky="w")
+        ttk.Radiobutton(hist_tab, text="Last N days", value="days", variable=self._retain_mode_var).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(hist_tab, text="Keep last N days:").grid(row=1, column=0, sticky="e")
+        ttk.Entry(hist_tab, textvariable=self._retain_days_var, width=6).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(hist_tab, text="Max rows per daily log (split when exceeded):").grid(row=2, column=0, sticky="e")
+        ttk.Entry(hist_tab, textvariable=self._max_rows_var, width=10).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Checkbutton(hist_tab, text="Write Planned.csv (when history kept)", variable=self._write_planned_var).grid(row=3, column=1, sticky="w", pady=6)
+
+        ttk.Button(win, text="Save", command=self._settings_save_and_close(win)).pack(side="right", padx=10, pady=10)
+        ttk.Button(win, text="Cancel", command=win.destroy).pack(side="right", pady=10)
+
+    def _settings_save_and_close(self, win):
+        def inner():
+            for key, (dn, pn, db, lb) in self._job_entries.items():
+                self.CONFIG["JOBS"][key]["display_name"] = dn.get().strip() or key
+                self.CONFIG["JOBS"][key]["part_number"] = pn.get().strip()
+                try: self.CONFIG["JOBS"][key]["default_batch"] = max(1, int(db.get()))
+                except Exception: self.CONFIG["JOBS"][key]["default_batch"] = 1
+                self.CONFIG["JOBS"][key]["lightburn_file"] = lb.get().strip()
+            for key, btn in self.job_btns.items():
+                btn.config(text=self.CONFIG["JOBS"][key].get("display_name", key))
+            self.sel_job_lbl.config(text=self.CONFIG["JOBS"][self.selected_job.get()].get("display_name", self.selected_job.get()))
+            self.part_var.set(self.CONFIG["JOBS"][self.selected_job.get()]["part_number"])
+            self.batch_var.set(self.CONFIG["JOBS"][self.selected_job.get()]["default_batch"])
+
+            self.CONFIG["ROOT"] = (self._root_var.get().strip() or self.CONFIG["ROOT"]).rstrip("\\/")
+            self.CONFIG["OPEN_LB_FILE_ON_START"] = bool(self._open_lb_var.get())
+
+            self.CONFIG["SERIAL"]["enabled"] = bool(self._ser_en_var.get())
+            self.CONFIG["SERIAL"]["port"] = self._ser_port_var.get().strip() or self.CONFIG["SERIAL"]["port"]
+            try: self.CONFIG["SERIAL"]["baud"] = int(self._ser_baud_var.get())
+            except Exception: pass
+            self.CONFIG["SIMULATE"]["enabled"] = bool(self._sim_en_var.get())
+            self.CONFIG["SIMULATE"]["batch_done_on_done"] = bool(self._batch_done_var.get())
+            self.CONFIG["UI"]["hide_simulate_done"] = bool(self._hide_sim_var.get())
+            self.CONFIG["UI"]["show_test_buttons"] = bool(self._show_tests_var.get())
+
+            if self.save_config():
+                messagebox.showinfo("Saved", "Settings saved.")
+                self.DIRS, self.LB_BATCH, self.WORKING_BATCH, self.WORKING_COMPLETED_TODAY = self.derive_paths(); self.ensure_dirs()
+                if self.CONFIG["SIMULATE"]["enabled"]:
+                    self.update_conn_pill("SIMULATE", warn=True)
+                elif self.CONFIG["SERIAL"]["enabled"]:
+                    self.serial.enabled = True; self.serial.port = self.CONFIG["SERIAL"]["port"]; self.serial.baud = self.CONFIG["SERIAL"]["baud"]; self.serial.reconnect()
+                else:
+                    self.serial.enabled = False; self.update_conn_pill("Disabled", warn=True)
+                self.refresh_next_serial_label(); self.refresh_preview_upnext_and_lb()
+                self.update_visibility_from_settings()
+                win.destroy()
+        return inner
+
+    def poll_serial(self):
+        if self.CONFIG["SERIAL"]["enabled"] and not self.CONFIG["SIMULATE"]["enabled"]:
+            line = self.serial.readline()
+            if line: self.on_serial_line(line)
+            self.after(self.CONFIG["SERIAL"]["poll_ms"], self.poll_serial)
+
+class SerialHelper:
+    def __init__(self, cfg, status_cb, line_cb):
+        self.enabled = bool(cfg.get("enabled", False)); self.port = cfg.get("port", "COM6")
+        self.baud = int(cfg.get("baud", 115200))
+        self.start_cmd = cfg.get("start_command", "START\n")
+        self.stop_cmd  = cfg.get("stop_command",  "STOP\n")
+        self._status_cb = status_cb; self._line_cb = line_cb; self.ser = None
+
+    def _update_status(self, text, ok=False, warn=False):
+        if self._status_cb: self._status_cb(text, ok=ok, warn=warn)
+
+    def try_open(self):
+        if not self.enabled: self._update_status("Disabled", warn=True); return False
+        try:
+            import serial
+            if self.ser is None or not self.ser.is_open: self.ser = serial.Serial(self.port, self.baud, timeout=0)
+            self._update_status(f"Connected ({self.port})", ok=True); return True
+        except Exception:
+            self._update_status("Disconnected", warn=True); return False
+
+    def reconnect(self): self.close(); return self.try_open()
+    def close(self):
+        try:
+            if self.ser and self.ser.is_open: self.ser.close()
+        except Exception: pass
+        self._update_status("Disconnected", warn=True)
+
+    def send_start(self):
+        if not self.enabled: self._update_status("Disabled", warn=True); return False
+        try:
+            if self.try_open() and self.ser: self.ser.write(self.start_cmd.encode("utf-8")); return True
+        except Exception:
+            self._update_status("Disconnected", warn=True)
+        return False
+
+    def send_stop(self):
+        if not self.enabled: self._update_status("Disabled", warn=True); return False
+        try:
+            if self.try_open() and self.ser: self.ser.write(self.stop_cmd.encode("utf-8")); return True
+        except Exception:
+            self._update_status("Disconnected", warn=True); return False
+
+    def readline(self):
+        if not self.enabled or not self.try_open() or not self.ser: return ""
+        try:
+            line = self.ser.readline().decode(errors="ignore").strip()
+            return line
+        except Exception:
+            self._update_status("Disconnected", warn=True); return ""
+
+if __name__ == "__main__":
+    try:
+        App().mainloop()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception:
+        try:
+            import traceback
+            here = os.path.dirname(os.path.abspath(__file__))
+            with open(os.path.join(here, "startup_error.log"), "w", encoding="utf-8") as fh:
+                fh.write("Startup crash at %s\n\n" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                traceback.print_exc(file=fh)
+        except Exception:
+            pass
+        raise
