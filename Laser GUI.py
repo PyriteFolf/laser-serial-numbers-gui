@@ -217,7 +217,7 @@ DEFAULT_CONFIG = {
         "baud": 115200,
         "done_token": "DONE",
         "poll_ms": 10,
-        "auto_connect": True # NEW: Auto-connect on startup
+        "auto_connect": True 
     },
     "ESP32_PINS": {
         "board": "esp32-c6-evb",
@@ -241,10 +241,12 @@ DEFAULT_CONFIG = {
     },
     "MACHINE": {
         "enabled": False,
-        "code": ""
+        "code": "",
+        "open_door_on_complete": True
     },
     "UI": {
         "up_next_tail": 28,
+        "show_autofocus_btn": True,
         "job_button_colors": {
             "Job 8": "#2ecc71",
             "Job 9": "#3498db",
@@ -331,6 +333,7 @@ class App(tk.Tk):
         self.door_closed = False
         self.is_engraving = False
         self.is_air_on = False
+        self.is_startup_complete = False 
         self.af_enabled = self.CONFIG.get("AUTOFOCUS", {}).get("enabled", True)
         self._io_status_labels = {}
         self._io_update_after_id = None
@@ -381,6 +384,7 @@ class App(tk.Tk):
         self.job_keys = list(self.CONFIG["JOBS"].keys())
         self.selected_job = tk.StringVar(value="")
         self.last_selected_job = ""
+        self.last_valid_job = ""
         self._rebuild_job_buttons()
 
         info = ttk.Frame(left_frame, padding=8)
@@ -429,9 +433,7 @@ class App(tk.Tk):
         self.open_door_btn.pack(side="left", padx=10)
         self.af_btn = ttk.Button(controls, text="Auto Focus", command=self.do_autofocus)
         self.af_btn.pack(side="left", padx=10)
-        self.sim_btn = ttk.Button(controls, text="Simulate DONE", command=self.sim_done)
-        self.sim_btn.pack(side="left", padx=10)
-
+        
         self.input_status_var = tk.StringVar(value="Inputs: N/A")
         ttk.Label(self, textvariable=self.input_status_var, anchor="w", font=("Segoe UI", 9)).pack(fill="x", padx=8, pady=(4, 0))
 
@@ -457,7 +459,6 @@ class App(tk.Tk):
         self.after(30_000, self._watch_date_rollover)
         self.after(100, self._check_for_job_select_on_start)
         
-        # NEW: Auto-connect logic
         self.after(500, self._auto_connect_on_startup)
         
         if self.CONFIG.get("OPEN_LB_FILE_ON_START"):
@@ -465,13 +466,11 @@ class App(tk.Tk):
             self.after(delay, self._open_and_position_lb_for_current_job)
             
     def _auto_connect_on_startup(self):
-        """If auto-connect is enabled, find the last used port and connect to it."""
         if self.CONFIG["SERIAL"].get("auto_connect", False):
             last_port = self.CONFIG["SERIAL"].get("port")
             if not last_port:
                 return
 
-            # Find the full display name for the stored port (e.g., "COM3")
             full_port_name = ""
             for display_name, device_name in self.ports_dict.items():
                 if device_name == last_port:
@@ -484,7 +483,6 @@ class App(tk.Tk):
                 self.toggle_connection()
             else:
                 print(f"Could not find last used port '{last_port}' in available ports list.")
-
 
     def _get_available_ports(self):
         self.ports_dict = {}
@@ -547,11 +545,8 @@ class App(tk.Tk):
                 self.connect_button.config(text="Disconnect", bg="#E74C3C")
                 self.initialize_relays_off()
                 
-                # --- THIS IS THE HANDSHAKE ---
-                # After connecting, wait a moment then ask the ESP32 for all current states.
                 self.after(250, self.serial.get_all_states)
 
-                # --- NEW: SAVE LAST SUCCESSFUL PORT ---
                 self.CONFIG["SERIAL"]["port"] = port_name
                 self.save_config()
 
@@ -678,13 +673,6 @@ class App(tk.Tk):
             self.open_door_btn.config(text="OPEN DOOR", state="normal", bg="#3498db")
 
     def update_visibility_from_settings(self):
-        if hasattr(self, 'sim_btn'):
-            if not self.CONFIG["UI"].get("show_simulate_done", True):
-                try: self.sim_btn.pack_forget()
-                except Exception: pass
-            else:
-                if not self.sim_btn.winfo_ismapped(): self.sim_btn.pack(side="left", padx=10)
-        
         if hasattr(self, 'open_door_btn'):
             if not self.CONFIG["UI"].get("show_open_door_btn", True):
                 try: self.open_door_btn.pack_forget()
@@ -716,12 +704,33 @@ class App(tk.Tk):
         self._apply_job_visibility_for_pin_selection()
 
     def on_job_clicked(self, key):
-        if key and key != self.last_selected_job:
-            self.do_autofocus()
+        old_job = self.selected_job.get()
+        
+        if key:
+            self.selected_job.set(key)
+
+        if key and key != old_job:
+            print(f"DEBUG: Job change detected. Old: '{old_job}', New: '{key}'.")
+            should_autofocus = False
+            
+            # Condition 1: First job selection after app start
+            if not self.is_startup_complete:
+                print("DEBUG: Autofocus triggered by first job selection.")
+                should_autofocus = True
+                self.is_startup_complete = True
+                
+            # Condition 2 (MODIFIED): New job is different from the last *valid* job
+            elif self.last_valid_job and key != self.last_valid_job:
+                print("DEBUG: Autofocus triggered because new job differs from the last valid one.")
+                should_autofocus = True
+            
+            if should_autofocus:
+                self.do_autofocus()
 
         if key:
-            self.last_selected_job = key
-            self.selected_job.set(key)
+            # NEW: Update the tracker for the next change
+            self.last_valid_job = key 
+            
             self.sel_job_lbl.config(text=self.CONFIG["JOBS"][key].get("display_name", key))
             self.part_var.set(self.CONFIG["JOBS"][key]["part_number"])
             self.date_var.set(today_code())
@@ -735,6 +744,7 @@ class App(tk.Tk):
                 self.after(100, self._open_and_position_lb_for_current_job)
                 
         self._apply_job_visibility_for_pin_selection(active_key=key)
+        self._check_and_start_job_automatically()
 
     def compute_next_serial_from_completed(self, pn):
         mode = self.CONFIG["LOGGING"].get("retain_mode", "off")
@@ -987,26 +997,53 @@ class App(tk.Tk):
         self.is_engraving = False
         self.update_door_ui()
 
-    def start_laser_flow(self):
+    def _check_and_start_job_automatically(self):
         if self.is_engraving:
-            messagebox.showinfo("Engraving in Progress", "An engraving batch is already running. Please wait for it to finish or press ABORT / STOP.")
             return
-        if not self.door_closed:
-            messagebox.showwarning("Door Open", "Close the door (interlock) to start the laser.")
-            return
-        if not self.selected_job.get():
-            messagebox.showwarning("No Job", "No job selected. Trigger a job select pin or pick a job in Settings → Jobs.")
-            return
-        rows, codes = self.build_preview_rows()
-        if not rows:
-            messagebox.showwarning("Nothing to Engrave", "No items are queued for engraving.")
-            return
-        self.write_working_batch(rows); self.append_planned(rows)
-        self.is_engraving = True
-        self.update_door_ui()
-        self.status_var.set("Batch queued. Engraving… please wait."); self.banner_engraving()
+
+        if self.selected_job.get() and self.door_closed:
+            print("Auto-start conditions met. Starting laser flow.")
+            self.start_laser_flow()
+
+    def _trigger_laser_start(self):
+        if not self.is_engraving: return
+
+        self.status_var.set("Sending START pulse to laser...")
+        self.pulse_relay_by_name("Start", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Start")])
         
         job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
+        job_delay_sec = job_cfg.get("job_delay_sec", 1)
+        self.status_var.set(f"Job is running... Will complete in {job_delay_sec} seconds.")
+        
+        self.after(int(job_delay_sec * 1000), self._on_job_timer_complete)
+        
+    def _on_job_timer_complete(self):
+        if not self.is_engraving:
+            print("Job timer finished, but engraving state is false. Ignoring.")
+            return
+        
+        print(f"Job timer of {self.CONFIG['JOBS'][self.selected_job.get()].get('job_delay_sec')}s has completed.")
+        
+        if self.CONFIG["SIMULATE"]["batch_done_on_done"]:
+            self.complete_whole_batch()
+        else:
+            self.complete_one_item()
+
+    def start_laser_flow(self):
+        if self.is_engraving: return
+        if not self.door_closed: return
+        if not self.selected_job.get(): return
+        rows, codes = self.build_preview_rows()
+        if not rows: return
+        
+        self.write_working_batch(rows)
+        self.append_planned(rows)
+        self.is_engraving = True
+        self.update_door_ui()
+        self.banner_engraving()
+        
+        job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
+        air_before_sec = job_cfg.get("air_before_sec", 0)
         
         lb_path = self._current_job_lb_path()
         if lb_path and os.path.exists(lb_path):
@@ -1014,36 +1051,12 @@ class App(tk.Tk):
             delay_ms = int(self.CONFIG.get("LIGHTBURN", {}).get("post_open_delay_sec", 3) * 1000)
             self.after(delay_ms, self._position_lb_small_bottom_right)
 
-        self.after(500, self._start_air_and_laser_sequence)
-
-    def _start_air_and_laser_sequence(self):
-        if not self.is_engraving: return
-        job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
-        air_before_sec = job_cfg.get("air_before_sec", 0)
-        
-        self.status_var.set(f"Turning on air. Waiting for {air_before_sec} seconds before marking...")
-        self.set_relay_by_name("Air", 1)
-        
-        self.after(int(air_before_sec * 1000), self._trigger_start_pulse)
-
-    def _trigger_start_pulse(self):
-        if not self.is_engraving: return
-        job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
-        job_delay_sec = job_cfg.get("job_delay_sec", 0)
-        
-        self.status_var.set("Sending START pulse to laser...")
-        self.pulse_relay_by_name("Start", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Start")])
-
-        self.set_relay_by_name("Door Lock", 1)
+        self.status_var.set(f"Pulsing air, then waiting {air_before_sec}s...")
+        self.pulse_relay_by_name("Air", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Air")])
         self.set_relay_by_name("Stack Light", 1)
-        
-        self.after(int(job_delay_sec * 1000), self._unlock_door_and_turn_off_light)
 
-    def _unlock_door_and_turn_off_light(self):
-        if not self.is_engraving: return
-        self.status_var.set("Job running. Door is now unlocked and stack light is on.")
-        self.pulse_relay_by_name("Door Lock", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Door Lock")])
-        
+        self.after(int(air_before_sec * 1000), self._trigger_laser_start)
+
     def abort_stop_flow(self):
         self.status_var.set("Aborting job. Stopping all processes.")
         self.set_relay_by_name("Air", 0)
@@ -1051,6 +1064,21 @@ class App(tk.Tk):
         self.set_relay_by_name("Stack Light", 0)
         self.cancel_batch()
         self._reenable_start_button()
+
+    def _run_focus_cycle(self):
+        if not self.selected_job.get(): return
+
+        job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
+        focus_x = float(job_cfg.get("focus_height", 0.0))
+
+        self.status_var.set(f"Sending Auto Focus pulse...")
+        self.pulse_relay_by_name("Auto Focus", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Auto Focus")])
+
+        if messagebox.askyesno("Focus Check", f"Was the Height set to {focus_x}?"):
+            self.status_var.set(f"Focus confirmed ({focus_x}).")
+        else:
+            self.status_var.set("Focus NOT confirmed. Retrying...")
+            self.after(100, self._run_focus_cycle)
 
     def do_autofocus(self):
         if not self.af_enabled:
@@ -1064,17 +1092,11 @@ class App(tk.Tk):
         if not self.selected_job.get():
             messagebox.showwarning("No Job", "Please select a job first.")
             return
-
-        job_cfg = self.CONFIG["JOBS"][self.selected_job.get()]
-        focus_x = float(job_cfg.get("focus_height", 0.0))
         
-        self.status_var.set(f"Sending Auto Focus pulse...")
-        self.pulse_relay_by_name("Auto Focus", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Auto Focus")])
-
-        if messagebox.askyesno("Focus Check", f"Was the Height set to {focus_x}?"):
-            self.status_var.set(f"Focus confirmed ({focus_x}).")
+        if messagebox.askyesno("Auto Focus", "Do you want to run Auto Focus for this job?"):
+            self._run_focus_cycle()
         else:
-            self.status_var.set("Focus NOT confirmed. Please try again.")
+            self.status_var.set("Auto Focus skipped by user.")
             
     def open_door_pulse(self):
         if self.is_engraving:
@@ -1097,17 +1119,14 @@ class App(tk.Tk):
         self._reenable_start_button()
 
     def _update_input_status_display(self):
-        """Generates and sets the string showing the current state of all input sensors."""
         status_parts = []
         input_names = self.CONFIG["INPUTS"]["names"]
         
         for i in range(len(input_names)):
             name = input_names[i]
-            if i == 3: # Handle Door Sensor (index 3)
-                 state_text = "Closed" if self.door_closed else "Open"
-            else: # Handle Job Sensors
-                # --- DEFINITIVELY FLIPPED LOGIC ---
-                # This logic is now inverted to match your hardware's behavior
+            if i == 3:
+                state_text = "Closed" if self.door_closed else "Open"
+            else:
                 if self.input_state[i] == 0:
                     state_text = "Active"
                 else:
@@ -1123,13 +1142,6 @@ class App(tk.Tk):
         if not line.upper().startswith("INFO:"):
             print(f"[RX] {line}")
         
-        if line == self.CONFIG["SERIAL"]["done_token"]:
-            if self.CONFIG["SIMULATE"]["batch_done_on_done"]:
-                self.complete_whole_batch()
-            else:
-                self.complete_one_item()
-            return
-
         if line.upper().startswith("RELAY:"):
             try:
                 _, rest = line.split(":",1)
@@ -1155,12 +1167,41 @@ class App(tk.Tk):
                     if is_closed != self.door_closed:
                         self.door_closed = is_closed
                         self.update_door_ui()
+                        self._check_and_start_job_automatically()
                 
                 self._maybe_select_job_from_input_pattern()
                 self._update_input_status_display()
             except Exception: 
                 print(f"[ERROR] Failed to parse INPUT line: {line}")
             return
+
+    def _run_end_of_job_actions(self):
+        self.status_var.set("Finalizing: Pulsing air, unlocking door, resetting stack light.")
+        self.pulse_relay_by_name("Air", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Air")])
+        
+        if self.CONFIG.get("MACHINE", {}).get("open_door_on_complete", True):
+            self.pulse_relay_by_name("Door Lock", self.CONFIG["RELAYS"]["pulse_ms"][self.CONFIG["RELAYS"]["names"].index("Door Lock")])
+        else:
+            self.status_var.set("Job complete. Manual door open required.")
+
+        self.set_relay_by_name("Stack Light", 0)
+
+    def _finalize_single_completion(self):
+        self._run_end_of_job_actions()
+        if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
+        self.refresh_preview_upnext_and_lb()
+        self.status_var.set("Batch complete."); self.banner_ok()
+        self.beep_batch_complete()
+        self.refresh_next_serial_label()
+        self._reenable_start_button()
+
+    def _finalize_batch_completion(self):
+        self._run_end_of_job_actions()
+        if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
+        self.refresh_preview_upnext_and_lb(); self.refresh_next_serial_label()
+        self.status_var.set("Batch complete (all items written)."); self.banner_ok()
+        self.beep_batch_complete()
+        self._reenable_start_button()
 
     def complete_one_item(self, result="OK"):
         rows = self.read_working_batch()
@@ -1172,16 +1213,16 @@ class App(tk.Tk):
         if rest:
             self.write_working_batch(rest); self.write_lightburn_batch([r["FullCode"] for r in rest])
             self.status_var.set("Next ready…"); self.banner_engraving()
-            self._reenable_start_button()
         else:
-            if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
-            self.refresh_preview_upnext_and_lb()
-            self.status_var.set("Batch complete."); self.banner_ok()
-            self.beep_batch_complete()
-            self.refresh_next_serial_label()
-            self.set_relay_by_name("Air", 0)
-            self.set_relay_by_name("Stack Light", 0)
-            self._reenable_start_button()
+            try:
+                job_key = head['JobID']
+                job_cfg = self.CONFIG["JOBS"][job_key]
+            except KeyError:
+                job_cfg = self.CONFIG["JOBS"].get(self.selected_job.get(), {})
+            
+            air_after_sec = job_cfg.get("air_after_sec", 0)
+            self.status_var.set(f"Final item complete. Waiting for post-job delay ({air_after_sec}s)...")
+            self.after(int(air_after_sec * 1000), self._finalize_single_completion)
             
     def complete_whole_batch(self, result="OK"):
         rows = self.read_working_batch()
@@ -1189,13 +1230,16 @@ class App(tk.Tk):
             self.status_var.set("Idle. (No items in queue)"); self.banner_idle(); return
         self.append_completed_many(rows, result=result)
         self.append_history_csv(rows, result=result)
-        if os.path.exists(self.WORKING_BATCH): os.remove(self.WORKING_BATCH)
-        self.refresh_preview_upnext_and_lb(); self.refresh_next_serial_label()
-        self.status_var.set("Batch complete (all items written)."); self.banner_ok()
-        self.beep_batch_complete()
-        self.set_relay_by_name("Air", 0)
-        self.set_relay_by_name("Stack Light", 0)
-        self._reenable_start_button()
+        
+        try:
+            job_key = rows[0]['JobID']
+            job_cfg = self.CONFIG["JOBS"][job_key]
+        except (IndexError, KeyError):
+            job_cfg = self.CONFIG["JOBS"].get(self.selected_job.get(), {})
+
+        air_after_sec = job_cfg.get("air_after_sec", 0)
+        self.status_var.set(f"Batch complete. Waiting for post-job delay ({air_after_sec}s)...")
+        self.after(int(air_after_sec * 1000), self._finalize_batch_completion)
 
     def beep_batch_complete(self):
         try:
@@ -1256,20 +1300,19 @@ class App(tk.Tk):
             
             for i, label in self._io_status_labels.items():
                 if i < len(input_names):
-                    if i == 3: # Handle Door Sensor
+                    if i == 3:
                         if self.door_closed:
                             label.config(text="Closed", bg="#27ae60", fg="white")
                         else:
                             label.config(text="Open", bg="#e74c3c", fg="white")
-                    else: # Handle Job Sensors
-                        # --- DEFINITIVELY FLIPPED LOGIC ---
+                    else:
                         if self.input_state[i] == 0:
                             label.config(text="Active", bg="#27ae60", fg="white")
                         else:
                             label.config(text="Inactive", bg="#7f8c8d", fg="white")
         except (IndexError, KeyError) as e:
             print(f"Error updating I/O status display: {e}")
-        
+    
     def _build_job_settings_tab(self, jobs_tab):
         for w in jobs_tab.winfo_children(): w.destroy()
         
@@ -1363,15 +1406,22 @@ class App(tk.Tk):
         for w in sys_tab.winfo_children(): w.destroy()
         self._root_var = tk.StringVar(value=self.CONFIG["ROOT"])
         self._open_lb_var = tk.BooleanVar(value=self.CONFIG["OPEN_LB_FILE_ON_START"])
+        self._open_door_var = tk.BooleanVar(value=self.CONFIG.get("MACHINE", {}).get("open_door_on_complete", True))
+
         ttk.Label(sys_tab, text="Root Folder:").grid(row=0, column=0, sticky="e")
         ttk.Entry(sys_tab, textvariable=self._root_var, width=60).grid(row=0, column=1, sticky="w", padx=6)
         ttk.Button(sys_tab, text="Browse…", command=lambda: self._root_var.set(filedialog.askdirectory(title="Pick root folder") or self._root_var.get())).grid(row=0, column=2, sticky="w")
-        ttk.Checkbutton(sys_tab, text="Open LightBurn file automatically", variable=self._open_lb_var).grid(row=1, column=1, sticky="w", pady=8)
-        ttk.Button(sys_tab, text="Save", command=lambda: self._save_system_settings(sys_tab)).grid(row=2, column=1, sticky="e", pady=10)
+        
+        ttk.Checkbutton(sys_tab, text="Open LightBurn file automatically", variable=self._open_lb_var).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(sys_tab, text="Automatically open door upon job completion", variable=self._open_door_var).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Button(sys_tab, text="Save", command=lambda: self._save_system_settings(sys_tab)).grid(row=3, column=1, sticky="e", pady=10)
 
     def _save_system_settings(self, sys_tab):
         self.CONFIG["ROOT"] = (self._root_var.get().strip() or self.CONFIG["ROOT"]).rstrip("\\/")
         self.CONFIG["OPEN_LB_FILE_ON_START"] = bool(self._open_lb_var.get())
+        self.CONFIG.setdefault("MACHINE", {})
+        self.CONFIG["MACHINE"]["open_door_on_complete"] = bool(self._open_door_var.get())
         if self.save_config():
             messagebox.showinfo("Saved", "System settings saved.", parent=sys_tab)
             self.DIRS, self.LB_BATCH, self.WORKING_BATCH, self.WORKING_COMPLETED_TODAY = self.derive_paths(); self.ensure_dirs()
@@ -1398,24 +1448,22 @@ class App(tk.Tk):
     def _build_serial_settings_tab(self, ser_tab):
         for w in ser_tab.winfo_children(): w.destroy()
         
-        # Define variables
         self._ser_en_var = tk.BooleanVar(value=self.CONFIG["SERIAL"]["enabled"])
         self._sim_en_var = tk.BooleanVar(value=self.CONFIG["SIMULATE"]["enabled"])
         self._batch_done_var = tk.BooleanVar(value=self.CONFIG["SIMULATE"]["batch_done_on_done"])
         self._ser_port_var = tk.StringVar(value=self.CONFIG["SERIAL"]["port"])
         self._ser_baud_var = tk.IntVar(value=int(self.CONFIG["SERIAL"]["baud"]))
-        self._auto_connect_var = tk.BooleanVar(value=self.CONFIG["SERIAL"].get("auto_connect", True)) # NEW
+        self._auto_connect_var = tk.BooleanVar(value=self.CONFIG["SERIAL"].get("auto_connect", True))
 
-        # Layout widgets
         f1 = ttk.Frame(ser_tab); f1.pack(fill="x", pady=2)
         ttk.Checkbutton(f1, text="Enable serial (ESP32 pedal/stop/AF)", variable=self._ser_en_var).pack(side="left")
         
         f_auto = ttk.Frame(ser_tab); f_auto.pack(fill="x", pady=2)
-        ttk.Checkbutton(f_auto, text="Auto-connect to last used port on startup", variable=self._auto_connect_var).pack(side="left") # NEW
+        ttk.Checkbutton(f_auto, text="Auto-connect to last used port on startup", variable=self._auto_connect_var).pack(side="left")
 
         f2 = ttk.Frame(ser_tab); f2.pack(fill="x", pady=2)
         ttk.Checkbutton(f2, text="Simulate Mode (no hardware)", variable=self._sim_en_var).pack(side="left")
-        ttk.Checkbutton(f2, text="Treat DONE as 'whole batch complete'", variable=self._batch_done_var).pack(side="left", padx=12)
+        ttk.Checkbutton(f2, text="Treat Job Delay as 'whole batch complete'", variable=self._batch_done_var).pack(side="left", padx=12)
         
         f3 = ttk.Frame(ser_tab); f3.pack(fill="x", pady=10)
         ttk.Label(f3, text="Port:").pack(side="left")
@@ -1428,7 +1476,7 @@ class App(tk.Tk):
     def _save_serial_settings(self, ser_tab):
         self.CONFIG["SERIAL"]["enabled"] = bool(self._ser_en_var.get())
         self.CONFIG["SERIAL"]["port"] = self._ser_port_var.get().strip() or self.CONFIG["SERIAL"]["port"]
-        self.CONFIG["SERIAL"]["auto_connect"] = bool(self._auto_connect_var.get()) # NEW
+        self.CONFIG["SERIAL"]["auto_connect"] = bool(self._auto_connect_var.get())
         try: self.CONFIG["SERIAL"]["baud"] = int(self._ser_baud_var.get())
         except Exception: pass
         self.CONFIG["SIMULATE"]["enabled"] = bool(self._sim_en_var.get())
@@ -1453,7 +1501,6 @@ class App(tk.Tk):
                 self.af_btn.config(state="disabled")
 
     def _build_io_settings_tab(self, io_tab, parent_window):
-        # This function remains the same as the previous version
         for w in io_tab.winfo_children(): w.destroy()
         main_frame = ttk.Frame(io_tab)
         main_frame.pack(fill="both", expand=True, padx=5, pady=5)
@@ -1537,7 +1584,8 @@ class App(tk.Tk):
         
         self._hist_en_var = tk.BooleanVar(value=self.CONFIG["HISTORY"].get("enabled", True))
         self._af_disabled_var = tk.BooleanVar(value=not self.CONFIG.get("AUTOFOCUS", {}).get("enabled", True))
-        
+        self._show_af_btn_var = tk.BooleanVar(value=self.CONFIG.get("UI", {}).get("show_autofocus_btn", True))
+
         ttk.Label(paths_tab, text="File Paths:").grid(row=0, column=0, sticky="w", pady=(0,6), columnspan=3)
         self._nb_path_var = tk.StringVar(value=self.CONFIG.get("FILE_PATHS", {}).get("next_batch_path", ""))
         self._ct_path_var = tk.StringVar(value=self.CONFIG.get("FILE_PATHS", {}).get("completed_today_path", ""))
@@ -1555,10 +1603,13 @@ class App(tk.Tk):
         ttk.Entry(paths_tab, textvariable=self._eh_path_var, width=80).grid(row=3, column=1, sticky="w", padx=6)
         ttk.Button(paths_tab, text="Browse…", command=lambda: self._eh_path_var.set(filedialog.asksaveasfilename(defaultextension=".csv") or self._eh_path_var.get())).grid(row=3, column=2)
 
-        ttk.Checkbutton(paths_tab, text="Enable History Log (saves to Entire History Path)", variable=self._hist_en_var).grid(row=4, column=1, sticky="w", pady=10)
-        ttk.Checkbutton(paths_tab, text="Disable Autofocus", variable=self._af_disabled_var, command=self.update_af_button_state).grid(row=5, column=1, sticky="w", pady=10)
+        ttk.Separator(paths_tab, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", pady=10)
+
+        ttk.Checkbutton(paths_tab, text="Enable History Log (saves to Entire History Path)", variable=self._hist_en_var).grid(row=5, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(paths_tab, text="Disable Autofocus Feature", variable=self._af_disabled_var, command=self.update_af_button_state).grid(row=6, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(paths_tab, text="Show Auto Focus Button on Main Screen", variable=self._show_af_btn_var).grid(row=7, column=1, sticky="w", pady=4)
         
-        ttk.Button(paths_tab, text="Save", command=lambda: self._save_paths_settings(paths_tab)).grid(row=6, column=1, sticky="e", pady=10)
+        ttk.Button(paths_tab, text="Save", command=lambda: self._save_paths_settings(paths_tab)).grid(row=8, column=1, sticky="e", pady=10)
 
     def _save_paths_settings(self, paths_tab):
         self.CONFIG.setdefault("HISTORY", {})
@@ -1572,11 +1623,15 @@ class App(tk.Tk):
         self.CONFIG.setdefault("AUTOFOCUS", {})
         self.CONFIG["AUTOFOCUS"]["enabled"] = not bool(self._af_disabled_var.get())
         self.af_enabled = self.CONFIG["AUTOFOCUS"]["enabled"]
+        
+        self.CONFIG.setdefault("UI", {})
+        self.CONFIG["UI"]["show_autofocus_btn"] = bool(self._show_af_btn_var.get())
 
         if self.save_config():
-            messagebox.showinfo("Saved", "File Paths settings saved.", parent=paths_tab)
+            messagebox.showinfo("Saved", "File Paths & UI settings saved.", parent=paths_tab)
             self.DIRS, self.LB_BATCH, self.WORKING_BATCH, self.WORKING_COMPLETED_TODAY = self.derive_paths()
             self.update_af_button_state()
+            self.update_visibility_from_settings()
 
     def _test_relay(self, index):
         name = self.CONFIG["RELAYS"]["names"][index]
@@ -1620,8 +1675,8 @@ class App(tk.Tk):
         name = self.CONFIG["RELAYS"]["names"][i]
         
         if self.CONFIG["RELAYS"]["disabled"][i]:
-             self.status_var.set(f"Warning: {name} is disabled in settings.")
-             return
+            self.status_var.set(f"Warning: {name} is disabled in settings.")
+            return
 
         if self.CONFIG["SIMULATE"]["enabled"]:
             if ms > 0:
@@ -1701,7 +1756,6 @@ class App(tk.Tk):
         if current_pattern is None or current_pattern == "000":
             if self.selected_job.get():
                 self.selected_job.set("")
-                self.last_selected_job = ""
                 self.sel_job_lbl.config(text="--")
                 self.part_var.set("")
                 self.date_var.set("")
@@ -1728,10 +1782,8 @@ class App(tk.Tk):
         else:
             if self.selected_job.get() != "":
                 self.selected_job.set("")
-                self.last_selected_job = ""
                 self.status_var.set(f"Warning: Input pattern '{current_pattern}' does not match any configured job. Cleared job selection.")
             self._apply_job_visibility_for_pin_selection(active_key=None)
-
 
     def _apply_job_visibility_for_pin_selection(self, active_key=None):
         for btn in self.job_btns.values():
@@ -1747,7 +1799,6 @@ class App(tk.Tk):
             self.jobs_frame.config(text=f"Active Job: {self.CONFIG['JOBS'][active_key]['display_name']}")
         else:
             self.jobs_frame.config(text="Active Job: (None Selected)")
-
 
     def set_relay_by_name(self, name, val):
         try:
@@ -1795,8 +1846,8 @@ class SerialHelper:
         self.close()
         
         if not self.enabled:
-             self._update_status("Disabled (in Settings)", warn=True)
-             return False
+            self._update_status("Disabled (in Settings)", warn=True)
+            return False
         
         try:
             self.ser = serial.Serial(port_name, self.baud, timeout=0.5)
@@ -1838,7 +1889,6 @@ class SerialHelper:
             self.close()
             return False
 
-    # NEW method for the handshake
     def get_all_states(self): return self._write(b"GETSTATE\n")
     def relay_set(self, i, v): return self._write(f"RSET {int(i)} {1 if v else 0}\n".encode())
     def relay_toggle(self, i): return self._write(f"RTGL {int(i)}\n".encode())
